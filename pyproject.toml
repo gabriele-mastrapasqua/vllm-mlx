@@ -34,6 +34,7 @@ dependencies = [
     "transformers>=5.0.0",  # Required by mlx-lm>=0.30.6 for MoE model support
     "tokenizers>=0.19.0",
     "huggingface-hub>=0.23.0",
+    "filelock>=3.20.0",  # Required by huggingface-hub for proper locking
     "numpy>=1.24.0",
     "pillow>=10.0.0",
     "tqdm>=4.66.0",
@@ -78,7 +79,7 @@ vision = [
 ]
 # Audio dependencies for TTS/STT (mlx-audio)
 audio = [
-    "mlx-audio>=0.2.9",
+    "mlx-audio>=0.3.1",
     "sounddevice>=0.4.0",
     "soundfile>=0.12.0",
     "scipy>=1.10.0",
