@@ -64,6 +64,14 @@ vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000 --continuous
 
 # With API key authentication
 vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000 --api-key your-secret-key
+
+# With tool calling (Qwen example)
+vllm-mlx serve mlx-community/Qwen2.5-3B-Instruct-4bit --port 8000 \
+  --continuous-batching --enable-auto-tool-choice --tool-call-parser qwen
+
+# Debug logging (shows full prompts, tool injection, cache details)
+vllm-mlx serve mlx-community/Qwen2.5-3B-Instruct-4bit --port 8000 \
+  --continuous-batching --log-level debug
 ```
 
 ### Use with OpenAI SDK
