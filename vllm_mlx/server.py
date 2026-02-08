@@ -165,6 +165,9 @@ _COMPACT_SYSTEM_REPLACEMENT = (
     "- To find files: use Glob tool\n"
     "- To search file contents: use Grep tool\n"
     "NEVER simulate, guess, or hallucinate tool output. ALWAYS call the tool.\n"
+    "ONLY use tools that are listed in the tools array. NEVER invent or guess tool names.\n"
+    "If the user asks a general knowledge question or something you can answer directly, "
+    "just respond in text WITHOUT calling any tool.\n"
     "Respond in the same language as the user."
 )
 
