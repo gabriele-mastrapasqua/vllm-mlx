@@ -47,6 +47,11 @@ from .models import (
     AudioTranscriptionResponse,
     AudioSpeechRequest,
     AudioSeparationRequest,
+    # Embeddings
+    EmbeddingRequest,
+    EmbeddingData,
+    EmbeddingUsage,
+    EmbeddingResponse,
 )
 
 from .utils import (
@@ -104,6 +109,11 @@ __all__ = [
     "AudioTranscriptionResponse",
     "AudioSpeechRequest",
     "AudioSeparationRequest",
+    # Embeddings
+    "EmbeddingRequest",
+    "EmbeddingData",
+    "EmbeddingUsage",
+    "EmbeddingResponse",
     # Utils
     "clean_output_text",
     "is_mllm_model",
