@@ -77,6 +77,13 @@ def serve_command(args):
         server._enable_auto_tool_choice = False
         server._tool_call_parser = None
 
+    # Configure tool schema compaction
+    server._compact_tools = args.compact_tools
+    server._compact_tools_level = getattr(args, "compact_tools_level", "moderate")
+    server._max_tools = args.max_tools
+    server._compact_system_prompt = args.compact_system_prompt
+    server._max_system_prompt_chars = args.max_system_prompt_chars
+
     # Configure generation defaults
     if args.default_temperature is not None:
         server._default_temperature = args.default_temperature
@@ -100,6 +107,12 @@ def serve_command(args):
         print(f"  Tool calling: ENABLED (parser: {args.tool_call_parser})")
     else:
         print("  Tool calling: Use --enable-auto-tool-choice to enable")
+    if args.compact_tools:
+        print(f"  Tool compaction: ENABLED (level: {args.compact_tools_level})")
+    if args.max_tools:
+        print(f"  Max tools per request: {args.max_tools}")
+    if args.compact_system_prompt:
+        print(f"  System prompt compaction: ENABLED (max {args.max_system_prompt_chars} chars)")
     print("=" * 60)
 
     # Auto-detect max_tokens from model config if not specified
@@ -572,6 +585,37 @@ Examples:
             "kimi, granite, nemotron, xlam, functionary, glm47. "
             "Required for --enable-auto-tool-choice."
         ),
+    )
+    # Tool schema compaction (for small models)
+    serve_parser.add_argument(
+        "--compact-tools",
+        action="store_true",
+        help="Compact tool schemas to reduce token usage. Recommended for small models (3B-7B).",
+    )
+    serve_parser.add_argument(
+        "--compact-tools-level",
+        type=str,
+        default="moderate",
+        choices=["moderate", "aggressive"],
+        help="Compaction level: moderate (short descriptions) or aggressive (no descriptions)",
+    )
+    serve_parser.add_argument(
+        "--max-tools",
+        type=int,
+        default=None,
+        help="Max tools per request. Extra tools silently dropped.",
+    )
+    serve_parser.add_argument(
+        "--compact-system-prompt",
+        action="store_true",
+        help="Truncate long system prompts to reduce token usage. "
+        "Appends a tool-use reminder. Recommended for small models with tool-heavy clients.",
+    )
+    serve_parser.add_argument(
+        "--max-system-prompt-chars",
+        type=int,
+        default=2000,
+        help="Max chars for system prompt when --compact-system-prompt is enabled (default: 2000)",
     )
     # Generation defaults
     serve_parser.add_argument(

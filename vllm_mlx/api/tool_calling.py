@@ -437,6 +437,51 @@ def build_tool_system_prompt(tools: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def compact_tool_schema(tools: list[dict], level: str = "moderate") -> list[dict]:
+    """Compact tool schemas to reduce token usage.
+
+    Args:
+        tools: List of tool definitions in template format.
+        level: "moderate" (short descriptions) or "aggressive" (no descriptions).
+
+    Returns:
+        Compacted tool definitions.
+    """
+    import copy
+
+    compacted = []
+    for tool in tools:
+        tool = copy.deepcopy(tool)
+        func = tool.get("function", {})
+        desc = func.get("description", "")
+        if level == "aggressive":
+            func.pop("description", None)
+        elif desc:
+            first_sentence = desc.split(".")[0].split("\n")[0][:80]
+            func["description"] = first_sentence + "." if first_sentence else ""
+        _compact_properties(func.get("parameters", {}), level)
+        compacted.append(tool)
+    return compacted
+
+
+def _compact_properties(schema: dict, level: str) -> None:
+    """Recursively strip metadata from a JSON Schema properties block."""
+    for key in ["title", "additionalProperties", "$defs", "examples", "default"]:
+        schema.pop(key, None)
+    for prop_schema in schema.get("properties", {}).values():
+        prop_schema.pop("description", None)
+        prop_schema.pop("title", None)
+        prop_schema.pop("default", None)
+        prop_schema.pop("examples", None)
+        if "enum" in prop_schema and len(prop_schema["enum"]) > 5:
+            prop_schema["enum"] = prop_schema["enum"][:3]
+        if prop_schema.get("type") == "object":
+            _compact_properties(prop_schema, level)
+        if prop_schema.get("type") == "array" and isinstance(prop_schema.get("items"), dict):
+            if prop_schema["items"].get("type") == "object":
+                _compact_properties(prop_schema["items"], level)
+
+
 def format_tool_call_for_message(tool_call: ToolCall) -> dict:
     """
     Format a ToolCall object for inclusion in a message.

@@ -181,6 +181,8 @@ CMD=(
   --stream-interval "$STREAM_INTERVAL"
   --rate-limit "$RATE_LIMIT"
   --timeout "$TIMEOUT"
+  --compact-tools
+  --compact-system-prompt
 )
 
 if [ -n "$PARSER" ]; then

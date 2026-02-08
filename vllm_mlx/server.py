@@ -88,6 +88,7 @@ from .api.models import (
 )
 from .api.tool_calling import (
     build_json_system_prompt,
+    compact_tool_schema,
     convert_tools_for_template,
     extract_json_schema_for_guided,
     parse_json_output,
@@ -136,6 +137,85 @@ _reasoning_parser = None  # ReasoningParser instance when enabled
 _enable_auto_tool_choice: bool = False
 _tool_call_parser: str | None = None  # Parser name: auto, mistral, qwen, llama, hermes
 _tool_parser_instance = None  # Instantiated parser
+
+# Tool schema compaction (opt-in via --compact-tools)
+_compact_tools: bool = False
+_compact_tools_level: str = "moderate"
+_max_tools: int | None = None
+
+# System prompt compaction (opt-in via --compact-system-prompt)
+_compact_system_prompt: bool = False
+_max_system_prompt_chars: int = 2000
+
+_COMPACT_SYSTEM_REPLACEMENT = (
+    "You are a helpful coding assistant. You have access to tools.\n"
+    "IMPORTANT: You MUST use the provided tools to complete tasks.\n"
+    "- To run a shell command: use Bash tool\n"
+    "- To read a file: use Read tool\n"
+    "- To write/create a file: use Write tool\n"
+    "- To edit a file: use Edit tool\n"
+    "- To find files: use Glob tool\n"
+    "- To search file contents: use Grep tool\n"
+    "NEVER simulate, guess, or hallucinate tool output. ALWAYS call the tool.\n"
+    "Respond in the same language as the user."
+)
+
+
+def _compact_system_message(messages: list) -> list:
+    """Replace oversized system messages with a short tool-focused prompt.
+
+    When the system prompt exceeds ``_max_system_prompt_chars``, it is
+    replaced entirely with a minimal prompt that instructs the model to
+    use tools.  This is necessary because small models (3B-7B) get
+    confused by long system prompts and fail to produce tool calls.
+
+    Only active when ``_compact_system_prompt`` is True.
+    """
+    if not _compact_system_prompt:
+        return messages
+
+    for msg in messages:
+        role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", None)
+        if role != "system":
+            continue
+
+        if isinstance(msg, dict):
+            content = msg.get("content", "")
+        else:
+            content = getattr(msg, "content", "") or ""
+
+        if not content or len(content) <= _max_system_prompt_chars:
+            break  # Short enough, leave as-is
+
+        original_len = len(content)
+        replacement = _COMPACT_SYSTEM_REPLACEMENT
+
+        if isinstance(msg, dict):
+            msg["content"] = replacement
+        else:
+            msg.content = replacement
+
+        logger.info(
+            f"Replaced system prompt ({original_len} chars) with compact version ({len(replacement)} chars)"
+        )
+        break
+
+    return messages
+
+
+def _convert_and_compact_tools(tools) -> list[dict] | None:
+    """Convert tools for template and apply compaction/limit if configured."""
+    if not tools:
+        return None
+    tool_list = list(tools)
+    if _max_tools and len(tool_list) > _max_tools:
+        logger.info(f"Limiting tools from {len(tool_list)} to {_max_tools}")
+        tool_list = tool_list[:_max_tools]
+    converted = convert_tools_for_template(tool_list)
+    if _compact_tools and converted:
+        converted = compact_tool_schema(converted, level=_compact_tools_level)
+        logger.debug(f"Compacted {len(converted)} tool schemas (level={_compact_tools_level})")
+    return converted
 
 
 def _load_prefix_cache_from_disk() -> None:
@@ -1126,6 +1206,12 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         total_chars += len(content)
         if m.role == "user":
             last_user_preview = content[:300]
+    # Log system prompt preview for debugging
+    for m in request.messages:
+        if (m.role == "system"):
+            sys_content = m.content if isinstance(m.content, str) else str(m.content)
+            logger.debug(f"[REQUEST] system prompt ({len(sys_content)} chars): {sys_content[:500]!r}")
+            break
     has_tools = bool(request.tools)
     n_tools = len(request.tools) if request.tools else 0
     logger.info(
@@ -1155,6 +1241,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         )
 
     has_media = bool(images or videos)
+
+    # Compact system prompt if enabled (before tool/JSON injection)
+    if request.tools:
+        messages = _compact_system_message(messages)
 
     # Handle response_format - inject system prompt if needed
     response_format = request.response_format
@@ -1186,7 +1276,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 
     # Add tools if provided
     if request.tools:
-        chat_kwargs["tools"] = convert_tools_for_template(request.tools)
+        chat_kwargs["tools"] = _convert_and_compact_tools(request.tools)
         if _tool_call_parser:
             chat_kwargs["tool_call_parser"] = _tool_call_parser
 
@@ -1396,6 +1486,9 @@ async def create_anthropic_message(
         preserve_native_format=engine.preserve_native_tool_format,
     )
 
+    if openai_request.tools:
+        messages = _compact_system_message(messages)
+
     chat_kwargs = {
         "max_tokens": openai_request.max_tokens or _default_max_tokens,
         "temperature": openai_request.temperature,
@@ -1403,7 +1496,7 @@ async def create_anthropic_message(
     }
 
     if openai_request.tools:
-        chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
+        chat_kwargs["tools"] = _convert_and_compact_tools(openai_request.tools)
         if _tool_call_parser:
             chat_kwargs["tool_call_parser"] = _tool_call_parser
 
@@ -1555,6 +1648,9 @@ async def _stream_anthropic_messages(
         preserve_native_format=engine.preserve_native_tool_format,
     )
 
+    if openai_request.tools:
+        messages = _compact_system_message(messages)
+
     chat_kwargs = {
         "max_tokens": openai_request.max_tokens or _default_max_tokens,
         "temperature": openai_request.temperature,
@@ -1562,7 +1658,7 @@ async def _stream_anthropic_messages(
     }
 
     if openai_request.tools:
-        chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
+        chat_kwargs["tools"] = _convert_and_compact_tools(openai_request.tools)
         if _tool_call_parser:
             chat_kwargs["tool_call_parser"] = _tool_call_parser
 
@@ -1890,7 +1986,7 @@ async def stream_chat_completion(
             )
             yield f"data: {chunk.model_dump_json()}\n\n"
 
-    # Fallback: if tool parser accumulated text but never emitted tool_calls
+    # Fallback 1: if tool parser accumulated text but never emitted tool_calls
     # (e.g., </tool_call> never arrived - incomplete tool call)
     has_tool_markup = (
         "<tool_call>" in tool_accumulated_text
@@ -1904,6 +2000,7 @@ async def stream_chat_completion(
     ):
         result = tool_parser.extract_tool_calls(tool_accumulated_text)
         if result.tools_called:
+            tool_calls_detected = True
             tool_chunk = ChatCompletionChunk(
                 id=response_id,
                 model=request.model,
@@ -1929,11 +2026,51 @@ async def stream_chat_completion(
             )
             yield f"data: {tool_chunk.model_dump_json()}\n\n"
 
-    # Log throughput
+    # Fallback 2: generic parser handles raw JSON tool calls
+    # Small models may emit {"name":"Bash","arguments":{...}} without <tool_call> tags
+    if not tool_calls_detected and accumulated_text:
+        _, fallback_tool_calls = parse_tool_calls(accumulated_text)
+        if fallback_tool_calls:
+            tool_calls_detected = True
+            logger.debug(
+                f"[STREAM_FALLBACK] Generic parser found {len(fallback_tool_calls)} "
+                f"tool call(s) in accumulated text"
+            )
+            fallback_chunk = ChatCompletionChunk(
+                id=response_id,
+                model=request.model,
+                choices=[
+                    ChatCompletionChunkChoice(
+                        delta=ChatCompletionChunkDelta(
+                            tool_calls=[
+                                {
+                                    "index": i,
+                                    "id": tc.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc.function.name,
+                                        "arguments": tc.function.arguments,
+                                    },
+                                }
+                                for i, tc in enumerate(fallback_tool_calls)
+                            ]
+                        ),
+                        finish_reason="tool_calls",
+                    )
+                ],
+            )
+            yield f"data: {fallback_chunk.model_dump_json()}\n\n"
+
+    # Log throughput and raw output for debugging
     elapsed = time.perf_counter() - start_time
     tokens_per_sec = completion_tokens / elapsed if elapsed > 0 else 0
     logger.info(
         f"Chat completion (stream): {completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
+    )
+    logger.debug(
+        f"[STREAM_OUTPUT] accumulated_text={accumulated_text[:500]!r} "
+        f"tool_accumulated={tool_accumulated_text[:500]!r} "
+        f"tool_calls_detected={tool_calls_detected}"
     )
 
     # Send final chunk with usage if requested
