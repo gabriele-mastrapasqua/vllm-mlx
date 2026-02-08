@@ -162,6 +162,7 @@ class BatchedEngine(BaseEngine):
         self._mllm_scheduler = None  # MLLMScheduler for MLLM
         self._mllm_instance = None  # MLXMultimodalLM instance
         self._loaded = False
+        self._engine_started = False  # Track if engine loop is running
 
     @property
     def model_name(self) -> str:
@@ -260,6 +261,30 @@ class BatchedEngine(BaseEngine):
             tokenizer_config=tokenizer_config,
         )
 
+        # Set Metal memory limits to make allocation failures graceful
+        # instead of fatal Metal command buffer errors (SIGABRT)
+        try:
+            import mlx.core as mx
+
+            if mx.metal.is_available():
+                device_info = mx.device_info()
+                max_recommended = device_info.get(
+                    "max_recommended_working_set_size",
+                    device_info.get("memory_size", 0),
+                )
+                if max_recommended > 0:
+                    soft_limit = int(max_recommended * 0.90)
+                    mx.set_memory_limit(soft_limit)
+                    mx.set_cache_limit(32 * 1024 * 1024 * 1024)  # 32GB
+                    logger.info(
+                        f"Metal memory limits set: "
+                        f"allocation_limit={soft_limit / 1e9:.1f}GB "
+                        f"(90% of {max_recommended / 1e9:.1f}GB), "
+                        f"cache_limit=32GB"
+                    )
+        except Exception as e:
+            logger.warning(f"Failed to set Metal memory limits: {e}")
+
         # Create engine config
         scheduler_config = self._scheduler_config or SchedulerConfig()
         engine_config = EngineConfig(
@@ -345,10 +370,11 @@ class BatchedEngine(BaseEngine):
                 # Fall through to standard template
 
         if hasattr(tokenizer, "apply_chat_template"):
+            enable_thinking = "coder" not in self._model_name.lower()
             template_kwargs = {
                 "tokenize": False,
                 "add_generation_prompt": True,
-                "enable_thinking": True,
+                "enable_thinking": enable_thinking,
             }
             if tools:
                 template_kwargs["tools"] = tools
@@ -498,9 +524,11 @@ class BatchedEngine(BaseEngine):
             stop=stop or [],
         )
 
+        prefix_boundary = kwargs.pop("prefix_boundary", 0)
         request_id = await self._engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
+            prefix_boundary=prefix_boundary,
         )
 
         async for output in self._engine.stream_outputs(request_id):
@@ -575,6 +603,57 @@ class BatchedEngine(BaseEngine):
             **kwargs,
         )
 
+    def _compute_prefix_boundary(
+        self, messages: list[dict[str, Any]], tools: list[dict] | None = None
+    ) -> int:
+        """Compute token count for the shared prefix across message variations.
+
+        Uses a two-tokenization approach: tokenize the full prompt twice
+        (once as-is, once with the last user message replaced by a dummy)
+        and find the longest common prefix (LCP).  This gives the exact
+        boundary where different user suffixes diverge, avoiding template
+        discrepancies (e.g. Qwen3 <think> markers on last assistant).
+        """
+        # Find index of last user message
+        last_user_idx = None
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                last_user_idx = i
+                break
+        if last_user_idx is None or last_user_idx == 0:
+            return 0
+        try:
+            template_tools = convert_tools_for_template(tools) if tools else None
+
+            # Tokenize the real prompt
+            real_prompt = self._apply_chat_template(messages, template_tools)
+
+            # Build a dummy variant with different last user content
+            dummy_messages = list(messages)
+            dummy_messages[last_user_idx] = {
+                **messages[last_user_idx],
+                "content": "XXXXXXXXXX",
+            }
+            dummy_prompt = self._apply_chat_template(dummy_messages, template_tools)
+
+            tokenizer = self.tokenizer
+            if hasattr(tokenizer, "tokenizer"):
+                tokenizer = tokenizer.tokenizer
+
+            real_tokens = tokenizer.encode(real_prompt)
+            dummy_tokens = tokenizer.encode(dummy_prompt)
+
+            # Find LCP — the point where the two diverge is the boundary
+            lcp = 0
+            for j in range(min(len(real_tokens), len(dummy_tokens))):
+                if real_tokens[j] != dummy_tokens[j]:
+                    break
+                lcp = j + 1
+
+            return lcp
+        except Exception:
+            return 0
+
     async def stream_chat(
         self,
         messages: list[dict[str, Any]],
@@ -625,6 +704,11 @@ class BatchedEngine(BaseEngine):
             num_images=len(all_images),
         )
 
+        # Compute prefix boundary for cache
+        prefix_boundary = self._compute_prefix_boundary(messages, tools)
+        if prefix_boundary > 0:
+            kwargs["prefix_boundary"] = prefix_boundary
+
         async for output in self.stream_generate(
             prompt=prompt,
             max_tokens=max_tokens,
@@ -660,3 +744,64 @@ class BatchedEngine(BaseEngine):
         elif self._engine:
             return self._engine.get_cache_stats()
         return None
+
+    async def _inject_shared_model(
+        self,
+        model,
+        tokenizer,
+        start_engine: bool = True,
+    ) -> None:
+        """
+        Inject a pre-loaded shared model instead of loading a new one.
+
+        This is used by HybridEngine to share a single model instance
+        between SimpleEngine and BatchedEngine, saving ~44GB of RAM.
+
+        Args:
+            model: Pre-loaded MLX model
+            tokenizer: Pre-loaded tokenizer
+            start_engine: Whether to start the engine loop immediately.
+                         Set to False for HybridEngine (lazy start on first use).
+        """
+        from ..engine_core import AsyncEngineCore, EngineConfig
+        from ..scheduler import SchedulerConfig
+
+        self._model = model
+        self._tokenizer = tokenizer
+
+        # Create engine config
+        scheduler_config = self._scheduler_config or SchedulerConfig()
+        engine_config = EngineConfig(
+            model_name=self._model_name,
+            scheduler_config=scheduler_config,
+            stream_interval=self._stream_interval,
+        )
+
+        # Create async engine with shared model
+        self._engine = AsyncEngineCore(
+            model=self._model,
+            tokenizer=self._tokenizer,
+            config=engine_config,
+        )
+
+        # Only start engine loop if requested (HybridEngine starts lazily)
+        if start_engine:
+            await self._engine.engine.start()
+
+        self._loaded = True
+        self._engine_started = start_engine
+        logger.info(
+            f"BatchedEngine injected with shared model: {self._model_name} (started={start_engine})"
+        )
+
+    def save_cache_to_disk(self, cache_dir: str) -> bool:
+        """Save prefix cache to disk for persistence across restarts."""
+        if self._engine:
+            return self._engine.save_cache_to_disk(cache_dir)
+        return False
+
+    def load_cache_from_disk(self, cache_dir: str) -> int:
+        """Load prefix cache from disk. Returns number of entries loaded."""
+        if self._engine:
+            return self._engine.load_cache_from_disk(cache_dir)
+        return 0

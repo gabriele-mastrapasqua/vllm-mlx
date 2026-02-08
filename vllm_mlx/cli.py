@@ -53,6 +53,12 @@ def serve_command(args):
         server._enable_auto_tool_choice = False
         server._tool_call_parser = None
 
+    # Configure generation defaults
+    if args.default_temperature is not None:
+        server._default_temperature = args.default_temperature
+    if args.default_top_p is not None:
+        server._default_top_p = args.default_top_p
+
     # Security summary at startup
     print("=" * 60)
     print("SECURITY CONFIGURATION")
@@ -74,6 +80,10 @@ def serve_command(args):
 
     print(f"Loading model: {args.model}")
     print(f"Default max tokens: {args.max_tokens}")
+    if args.draft_model:
+        print("Speculative decoding: ENABLED")
+        print(f"  Draft model: {args.draft_model}")
+        print(f"  Draft tokens: {args.num_draft_tokens}")
 
     # Store MCP config path for FastAPI startup
     if args.mcp_config:
@@ -100,9 +110,13 @@ def serve_command(args):
             use_paged_cache=args.use_paged_cache,
             paged_cache_block_size=args.paged_cache_block_size,
             max_cache_blocks=args.max_cache_blocks,
+            # Chunked prefill
+            chunked_prefill_tokens=args.chunked_prefill_tokens,
         )
 
         print("Mode: Continuous batching (for multiple concurrent users)")
+        if args.chunked_prefill_tokens > 0:
+            print(f"Chunked prefill: {args.chunked_prefill_tokens} tokens per step")
         print(f"Stream interval: {args.stream_interval} tokens")
         if args.use_paged_cache:
             print(
@@ -127,6 +141,8 @@ def serve_command(args):
         scheduler_config=scheduler_config,
         stream_interval=args.stream_interval if args.continuous_batching else 1,
         max_tokens=args.max_tokens,
+        draft_model=args.draft_model,
+        num_draft_tokens=args.num_draft_tokens,
     )
 
     # Start server
@@ -463,6 +479,14 @@ Examples:
         default=1000,
         help="Maximum number of cache blocks (default: 1000)",
     )
+    # Chunked prefill
+    serve_parser.add_argument(
+        "--chunked-prefill-tokens",
+        type=int,
+        default=0,
+        help="Max prefill tokens per scheduler step (0=disabled). "
+        "Prevents starvation of active requests during long prefills.",
+    )
     # MCP options
     serve_parser.add_argument(
         "--mcp-config",
@@ -511,13 +535,40 @@ Examples:
             "nemotron",
             "xlam",
             "functionary",
+            "glm47",
         ],
         help=(
             "Select the tool call parser for the model. Options: "
             "auto (auto-detect), mistral, qwen, llama, hermes, deepseek, "
-            "kimi, granite, nemotron, xlam, functionary. "
+            "kimi, granite, nemotron, xlam, functionary, glm47. "
             "Required for --enable-auto-tool-choice."
         ),
+    )
+    # Generation defaults
+    serve_parser.add_argument(
+        "--default-temperature",
+        type=float,
+        default=None,
+        help="Default temperature for generation when not specified in request",
+    )
+    serve_parser.add_argument(
+        "--default-top-p",
+        type=float,
+        default=None,
+        help="Default top_p for generation when not specified in request",
+    )
+    # Speculative decoding options
+    serve_parser.add_argument(
+        "--draft-model",
+        type=str,
+        default=None,
+        help="Draft model for speculative decoding (must use same tokenizer as main model)",
+    )
+    serve_parser.add_argument(
+        "--num-draft-tokens",
+        type=int,
+        default=4,
+        help="Number of tokens to generate speculatively per step (default: 4)",
     )
 
     # Bench command

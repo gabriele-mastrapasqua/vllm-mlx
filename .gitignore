@@ -99,3 +99,7 @@ temp/
 # devenv
 .devenv/
 .devenv.flake.nix
+.envrc
+devenv.lock
+devenv.nix
+devenv.yaml

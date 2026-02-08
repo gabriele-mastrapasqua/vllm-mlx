@@ -49,7 +49,6 @@ import time
 import uuid
 from collections import defaultdict
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
@@ -58,6 +57,8 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 # Import from new modular API
 # Re-export for backwards compatibility with tests
+from .api.anthropic_adapter import anthropic_to_openai, openai_to_anthropic
+from .api.anthropic_models import AnthropicRequest
 from .api.models import (
     AssistantMessage,  # noqa: F401
     ChatCompletionChoice,  # noqa: F401
@@ -88,15 +89,25 @@ from .api.models import (
 from .api.tool_calling import (
     build_json_system_prompt,
     convert_tools_for_template,
+    extract_json_schema_for_guided,
     parse_json_output,
     parse_tool_calls,
 )
 from .api.utils import (
+    SPECIAL_TOKENS_PATTERN,
     clean_output_text,
+    extract_json_from_response,
     extract_multimodal_content,
     is_mllm_model,  # noqa: F401
+    strip_thinking_tags,
 )
-from .engine import BaseEngine, BatchedEngine, GenerationOutput, SimpleEngine
+from .engine import (
+    BaseEngine,
+    BatchedEngine,
+    GenerationOutput,
+    HybridEngine,
+    SimpleEngine,
+)
 from .tool_parsers import ToolParserManager
 
 logging.basicConfig(level=logging.INFO)
@@ -107,6 +118,8 @@ _engine: BaseEngine | None = None
 _model_name: str | None = None
 _default_max_tokens: int = 32768
 _default_timeout: float = 300.0  # Default request timeout in seconds (5 minutes)
+_default_temperature: float | None = None  # Set via --default-temperature
+_default_top_p: float | None = None  # Set via --default-top-p
 
 # Global MCP manager
 _mcp_manager = None
@@ -125,7 +138,50 @@ _tool_call_parser: str | None = None  # Parser name: auto, mistral, qwen, llama,
 _tool_parser_instance = None  # Instantiated parser
 
 
-@asynccontextmanager
+def _load_prefix_cache_from_disk() -> None:
+    """Load prefix cache from disk during startup."""
+    try:
+        d = _get_cache_dir()
+        logger.info(f"[lifespan] Loading prefix cache from {d}")
+        loaded = _engine.load_cache_from_disk(d)
+        if loaded > 0:
+            logger.info(f"[lifespan] Loaded {loaded} prefix cache entries")
+        else:
+            logger.info("[lifespan] No prefix cache entries found on disk")
+    except Exception as e:
+        logger.warning(f"[lifespan] Failed to load cache from disk: {e}", exc_info=True)
+
+
+def _save_prefix_cache_to_disk() -> None:
+    """Save prefix cache to disk during shutdown."""
+    try:
+        d = _get_cache_dir()
+        logger.info(f"[lifespan] Saving prefix cache to {d}")
+        saved = _engine.save_cache_to_disk(d)
+        if saved:
+            logger.info(f"[lifespan] Saved prefix cache to {d}")
+        else:
+            logger.info("[lifespan] No cache to save")
+    except Exception as e:
+        logger.warning(f"[lifespan] Failed to save cache to disk: {e}", exc_info=True)
+
+
+def _get_cache_dir() -> str:
+    """Get cache persistence directory based on model name."""
+    # Use global _model_name which is always a string, set during load_model()
+    model_name = _model_name if _model_name else "default"
+    logger.info(
+        f"[_get_cache_dir] _model_name={_model_name!r} type={type(_model_name)}"
+    )
+    # Sanitize model name for filesystem
+    safe_name = str(model_name).replace("/", "--").replace("\\", "--")
+    cache_dir = os.path.join(
+        os.path.expanduser("~"), ".cache", "vllm-mlx", "prefix_cache", safe_name
+    )
+    logger.info(f"[_get_cache_dir] cache_dir={cache_dir!r}")
+    return cache_dir
+
+
 async def lifespan(app: FastAPI):
     """FastAPI lifespan for startup/shutdown events."""
     global _engine, _mcp_manager
@@ -134,12 +190,20 @@ async def lifespan(app: FastAPI):
     if _engine is not None and hasattr(_engine, "_loaded") and not _engine._loaded:
         await _engine.start()
 
+    # Load persisted cache from disk (AFTER engine start — AsyncEngineCore must exist)
+    if _engine is not None and hasattr(_engine, "load_cache_from_disk"):
+        _load_prefix_cache_from_disk()
+
     # Initialize MCP if config provided
     mcp_config = os.environ.get("VLLM_MLX_MCP_CONFIG")
     if mcp_config:
         await init_mcp(mcp_config)
 
     yield
+
+    # Shutdown: Save cache to disk BEFORE stopping engine
+    if _engine is not None and hasattr(_engine, "save_cache_to_disk"):
+        _save_prefix_cache_to_disk()
 
     # Shutdown: Close MCP connections and stop engine
     if _mcp_manager is not None:
@@ -308,7 +372,9 @@ def _parse_tool_calls_with_parser(
             ]
             return result.content or "", tool_calls
         else:
-            return result.content or output_text, None
+            # Fallback: specific parser didn't find tool calls,
+            # try generic parser which handles more formats (e.g. Nemotron XML)
+            return parse_tool_calls(output_text)
     except Exception as e:
         logger.warning(f"Tool parser error: {e}")
         return parse_tool_calls(output_text)
@@ -350,6 +416,8 @@ def load_model(
     stream_interval: int = 1,
     max_tokens: int = 32768,
     force_mllm: bool = False,
+    draft_model: str | None = None,
+    num_draft_tokens: int = 4,
 ):
     """
     Load a model (auto-detects MLLM vs LLM).
@@ -361,6 +429,8 @@ def load_model(
         stream_interval: Tokens to batch before streaming (batched mode only)
         max_tokens: Default max tokens for generation
         force_mllm: Force loading as MLLM even if not auto-detected
+        draft_model: Optional draft model for speculative decoding
+        num_draft_tokens: Number of tokens to generate speculatively per step
     """
     global _engine, _model_name, _default_max_tokens, _tool_parser_instance
 
@@ -372,7 +442,28 @@ def load_model(
     if force_mllm:
         logger.info("Force MLLM mode enabled via --mllm flag")
 
-    if use_batching:
+    if draft_model:
+        logger.info(f"Speculative decoding enabled with draft model: {draft_model}")
+        logger.info(f"  num_draft_tokens: {num_draft_tokens}")
+
+    if use_batching and draft_model:
+        # Hybrid mode: shared model with speculative decoding + continuous batching
+        logger.info(f"Loading model with HybridEngine: {model_name}")
+        logger.info(
+            "  Hybrid mode: speculative decoding for single user, "
+            "batching for multiple users"
+        )
+        _engine = HybridEngine(
+            model_name=model_name,
+            draft_model=draft_model,
+            num_draft_tokens=num_draft_tokens,
+            scheduler_config=scheduler_config,
+            stream_interval=stream_interval,
+            force_mllm=force_mllm,
+        )
+        # HybridEngine will be started in lifespan (uvicorn's event loop)
+        logger.info(f"Model loaded (hybrid mode): {model_name}")
+    elif use_batching:
         logger.info(f"Loading model with BatchedEngine: {model_name}")
         _engine = BatchedEngine(
             model_name=model_name,
@@ -385,7 +476,12 @@ def load_model(
         logger.info(f"Model loaded (batched mode): {model_name}")
     else:
         logger.info(f"Loading model with SimpleEngine: {model_name}")
-        _engine = SimpleEngine(model_name=model_name, force_mllm=force_mllm)
+        _engine = SimpleEngine(
+            model_name=model_name,
+            force_mllm=force_mllm,
+            draft_model=draft_model,
+            num_draft_tokens=num_draft_tokens,
+        )
         # Start SimpleEngine synchronously (no background loop)
         # Use new_event_loop() for Python 3.10+ compatibility (get_event_loop() is deprecated)
         loop = asyncio.new_event_loop()
@@ -705,6 +801,184 @@ async def list_voices(model: str = "kokoro"):
 
 
 # =============================================================================
+# Streaming disconnect detection
+# =============================================================================
+
+
+async def _disconnect_guard(
+    generator: AsyncIterator[str],
+    raw_request: Request,
+    poll_interval: float = 0.5,
+) -> AsyncIterator[str]:
+    """Wrap streaming generator to abort on client disconnect.
+
+    Uses asyncio racing: each __anext__() on the inner generator is
+    raced against a disconnect poller.  This catches disconnects even
+    during prefill when no chunks are being yielded for tens of seconds.
+
+    On disconnect, aclose() propagates down the generator chain to
+    engine_core.stream_outputs() finally-block → abort_request().
+    """
+    import time as _time
+
+    _t0 = _time.monotonic()
+
+    def _elapsed():
+        return f"{_time.monotonic() - _t0:.1f}s"
+
+    logger.info(f"[disconnect_guard] START poll_interval={poll_interval}s")
+
+    async def _wait_disconnect():
+        poll_count = 0
+        while True:
+            await asyncio.sleep(poll_interval)
+            poll_count += 1
+            is_disc = await raw_request.is_disconnected()
+            if poll_count % 10 == 0 or is_disc:
+                logger.info(
+                    f"[disconnect_guard] poll #{poll_count} "
+                    f"disconnected={is_disc} elapsed={_elapsed()}"
+                )
+            if is_disc:
+                return
+
+    chunk_count = 0
+    disconnect_task: asyncio.Task | None = None
+    anext_task: asyncio.Task | None = None
+    try:
+        aiter = generator.__aiter__()
+        disconnect_task = asyncio.create_task(_wait_disconnect())
+        while True:
+            anext_task = asyncio.ensure_future(aiter.__anext__())
+            done, _ = await asyncio.wait(
+                [anext_task, disconnect_task],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if disconnect_task in done:
+                logger.info(
+                    f"[disconnect_guard] CLIENT DISCONNECTED after "
+                    f"{chunk_count} chunks, elapsed={_elapsed()}"
+                )
+                anext_task.cancel()
+                try:
+                    await anext_task
+                except (asyncio.CancelledError, StopAsyncIteration):
+                    pass
+                break
+            try:
+                chunk = anext_task.result()
+            except StopAsyncIteration:
+                logger.info(
+                    f"[disconnect_guard] generator exhausted normally, "
+                    f"{chunk_count} chunks, elapsed={_elapsed()}"
+                )
+                break
+            chunk_count += 1
+            if chunk_count == 1:
+                logger.info(
+                    f"[disconnect_guard] first chunk arrived, elapsed={_elapsed()}"
+                )
+            yield chunk
+    except GeneratorExit:
+        logger.info(
+            f"[disconnect_guard] GeneratorExit after {chunk_count} chunks, elapsed={_elapsed()}"
+        )
+    finally:
+        if disconnect_task and not disconnect_task.done():
+            disconnect_task.cancel()
+        if anext_task and not anext_task.done():
+            anext_task.cancel()
+        # NOTE: Do NOT call generator.aclose() here.  With run_in_executor,
+        # scheduler.step() runs in a background thread.  aclose() would throw
+        # GeneratorExit into the async-generator chain, which can trigger
+        # mlx::core::eval on the main thread while the executor thread is also
+        # mid-eval → Metal assertion failure → SIGABRT.
+        #
+        # Instead, rely on the task cancellation propagation:
+        #   anext_task.cancel() → CancelledError in stream_outputs()
+        #   → finally block → abort_request() → request removed from scheduler
+        logger.info(
+            f"[disconnect_guard] CLEANUP done, {chunk_count} chunks total, elapsed={_elapsed()}"
+        )
+
+
+async def _wait_with_disconnect(
+    coro,
+    raw_request: Request,
+    timeout: float,
+    poll_interval: float = 0.5,
+):
+    """Run a coroutine with both timeout and client disconnect detection.
+
+    For non-streaming requests where _disconnect_guard() can't be used.
+    Races the coroutine against a disconnect poller, same pattern as
+    _disconnect_guard but for awaitable (non-generator) coroutines.
+    """
+    import time as _time
+
+    _t0 = _time.monotonic()
+
+    task = asyncio.ensure_future(coro)
+
+    async def _wait_disconnect():
+        poll_count = 0
+        while True:
+            await asyncio.sleep(poll_interval)
+            poll_count += 1
+            is_disc = await raw_request.is_disconnected()
+            if poll_count % 10 == 0 or is_disc:
+                logger.info(
+                    f"[disconnect_guard] poll #{poll_count} "
+                    f"disconnected={is_disc} elapsed={_time.monotonic() - _t0:.1f}s"
+                )
+            if is_disc:
+                return
+
+    disconnect_task = asyncio.create_task(_wait_disconnect())
+
+    try:
+        done, _ = await asyncio.wait(
+            [task, disconnect_task],
+            timeout=timeout,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        if not done:
+            # Timeout
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+            raise HTTPException(
+                status_code=504,
+                detail=f"Request timed out after {timeout:.1f} seconds",
+            )
+
+        if disconnect_task in done:
+            # Client disconnected
+            logger.info(
+                f"[disconnect_guard] CLIENT DISCONNECTED (non-stream) "
+                f"elapsed={_time.monotonic() - _t0:.1f}s"
+            )
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+            return None  # Signal to caller that client disconnected
+
+        # Task completed
+        return task.result()
+
+    finally:
+        if not disconnect_task.done():
+            disconnect_task.cancel()
+        if not task.done():
+            task.cancel()
+
+
+# =============================================================================
 # Completion Endpoints
 # =============================================================================
 
@@ -712,16 +986,28 @@ async def list_voices(model: str = "kokoro"):
 @app.post(
     "/v1/completions", dependencies=[Depends(verify_api_key), Depends(check_rate_limit)]
 )
-async def create_completion(request: CompletionRequest):
+async def create_completion(request: CompletionRequest, raw_request: Request):
     """Create a text completion."""
     engine = get_engine()
 
     # Handle single prompt or list of prompts
     prompts = request.prompt if isinstance(request.prompt, list) else [request.prompt]
 
+    # --- Detailed request logging ---
+    prompt_preview = prompts[0][:200] if prompts else "(empty)"
+    prompt_len = sum(len(p) for p in prompts)
+    logger.info(
+        f"[REQUEST] POST /v1/completions stream={request.stream} "
+        f"max_tokens={request.max_tokens} temp={request.temperature} "
+        f"prompt_chars={prompt_len} prompt_preview={prompt_preview!r}"
+    )
+
     if request.stream:
         return StreamingResponse(
-            stream_completion(engine, prompts[0], request),
+            _disconnect_guard(
+                stream_completion(engine, prompts[0], request),
+                raw_request,
+            ),
             media_type="text/event-stream",
         )
 
@@ -733,21 +1019,25 @@ async def create_completion(request: CompletionRequest):
     total_prompt_tokens = 0
 
     for i, prompt in enumerate(prompts):
-        try:
-            output = await asyncio.wait_for(
-                engine.generate(
-                    prompt=prompt,
-                    max_tokens=request.max_tokens or _default_max_tokens,
-                    temperature=request.temperature,
-                    top_p=request.top_p,
-                    stop=request.stop,
+        output = await _wait_with_disconnect(
+            engine.generate(
+                prompt=prompt,
+                max_tokens=request.max_tokens or _default_max_tokens,
+                temperature=(
+                    request.temperature
+                    if request.temperature is not None
+                    else _default_temperature
                 ),
-                timeout=timeout,
-            )
-        except asyncio.TimeoutError:
-            raise HTTPException(
-                status_code=504, detail=f"Request timed out after {timeout:.1f} seconds"
-            )
+                top_p=(
+                    request.top_p if request.top_p is not None else _default_top_p
+                ),
+                stop=request.stop,
+            ),
+            raw_request,
+            timeout=timeout,
+        )
+        if output is None:
+            return Response(status_code=499)  # Client closed request
 
         choices.append(
             CompletionChoice(
@@ -782,7 +1072,7 @@ async def create_completion(request: CompletionRequest):
     "/v1/chat/completions",
     dependencies=[Depends(verify_api_key), Depends(check_rate_limit)],
 )
-async def create_chat_completion(request: ChatCompletionRequest):
+async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):
     """
     Create a chat completion (supports multimodal content for VLM models).
 
@@ -826,6 +1116,27 @@ async def create_chat_completion(request: ChatCompletionRequest):
     """
     engine = get_engine()
 
+    # --- Detailed request logging ---
+    n_msgs = len(request.messages)
+    msg_roles = [m.role for m in request.messages]
+    total_chars = 0
+    last_user_preview = ""
+    for m in request.messages:
+        content = m.content if isinstance(m.content, str) else str(m.content)
+        total_chars += len(content)
+        if m.role == "user":
+            last_user_preview = content[:300]
+    has_tools = bool(request.tools)
+    n_tools = len(request.tools) if request.tools else 0
+    logger.info(
+        f"[REQUEST] POST /v1/chat/completions stream={request.stream} "
+        f"model={request.model!r} max_tokens={request.max_tokens} "
+        f"temp={request.temperature} msgs={n_msgs} roles={msg_roles} "
+        f"total_chars={total_chars} tools={n_tools} "
+        f"response_format={request.response_format}"
+    )
+    logger.info(f"[REQUEST] last user message preview: {last_user_preview!r}")
+
     # For MLLM models, keep original messages with embedded images
     # (MLLM.chat() extracts images from message content internally)
     if engine.is_mllm:
@@ -856,8 +1167,12 @@ async def create_chat_completion(request: ChatCompletionRequest):
     # Prepare kwargs
     chat_kwargs = {
         "max_tokens": request.max_tokens or _default_max_tokens,
-        "temperature": request.temperature,
-        "top_p": request.top_p,
+        "temperature": (
+            request.temperature
+            if request.temperature is not None
+            else _default_temperature
+        ),
+        "top_p": request.top_p if request.top_p is not None else _default_top_p,
     }
 
     # Add multimodal content
@@ -875,7 +1190,10 @@ async def create_chat_completion(request: ChatCompletionRequest):
 
     if request.stream:
         return StreamingResponse(
-            stream_chat_completion(engine, messages, request, **chat_kwargs),
+            _disconnect_guard(
+                stream_chat_completion(engine, messages, request, **chat_kwargs),
+                raw_request,
+            ),
             media_type="text/event-stream",
         )
 
@@ -883,14 +1201,36 @@ async def create_chat_completion(request: ChatCompletionRequest):
     start_time = time.perf_counter()
     timeout = request.timeout or _default_timeout
 
-    try:
-        output = await asyncio.wait_for(
-            engine.chat(messages=messages, **chat_kwargs), timeout=timeout
+    # Check if we should use guided generation for JSON schema
+    use_guided = False
+    json_schema = None
+    if response_format and not request.tools:
+        json_schema = extract_json_schema_for_guided(response_format)
+        if json_schema and hasattr(engine, "supports_guided_generation"):
+            use_guided = engine.supports_guided_generation
+            if use_guided:
+                logger.info("Using guided generation for JSON schema enforcement")
+
+    if use_guided and json_schema:
+        # Use guided generation for constrained JSON output
+        output = await _wait_with_disconnect(
+            engine.generate_with_schema(
+                messages=messages,
+                json_schema=json_schema,
+                **chat_kwargs,
+            ),
+            raw_request,
+            timeout=timeout,
         )
-    except asyncio.TimeoutError:
-        raise HTTPException(
-            status_code=504, detail=f"Request timed out after {timeout:.1f} seconds"
+    else:
+        # Standard generation
+        output = await _wait_with_disconnect(
+            engine.chat(messages=messages, **chat_kwargs),
+            raw_request,
+            timeout=timeout,
         )
+    if output is None:
+        return Response(status_code=499)  # Client closed request
 
     elapsed = time.perf_counter() - start_time
     tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
@@ -923,12 +1263,22 @@ async def create_chat_completion(request: ChatCompletionRequest):
     # Determine finish reason
     finish_reason = "tool_calls" if tool_calls else output.finish_reason
 
+    # Clean and strip thinking tags from content
+    # Thinking tags break JSON parsing in clients expecting pure content
+    # Also extract JSON if model outputs reasoning text before JSON
+    final_content = None
+    if cleaned_text:
+        final_content = strip_thinking_tags(clean_output_text(cleaned_text))
+        # If response looks like it ends with JSON, extract just the JSON part
+        # This handles Qwen3 reasoning mode: "Let me think... {json}"
+        final_content = extract_json_from_response(final_content)
+
     return ChatCompletionResponse(
         model=request.model,
         choices=[
             ChatCompletionChoice(
                 message=AssistantMessage(
-                    content=clean_output_text(cleaned_text) if cleaned_text else None,
+                    content=final_content,
                     reasoning=reasoning_text,
                     tool_calls=tool_calls,
                 ),
@@ -947,7 +1297,11 @@ def _inject_json_instruction(messages: list, instruction: str) -> list:
     """
     Inject JSON instruction into messages.
 
-    If a system message exists, append to it. Otherwise, prepend a new system message.
+    PREPENDS instruction to system message for better instruction following.
+    JSON formatting instructions at the beginning of system message are more
+    likely to be followed than instructions at the end.
+
+    If a system message exists, prepend to it. Otherwise, prepend a new system message.
     """
     messages = list(messages)  # Make a copy
 
@@ -960,19 +1314,363 @@ def _inject_json_instruction(messages: list, instruction: str) -> list:
             break
 
     if system_idx is not None:
-        # Append to existing system message
+        # PREPEND to existing system message (not append!)
+        # Instructions at the start are more effective
         msg = messages[system_idx]
         if isinstance(msg, dict):
             existing = msg.get("content", "")
-            msg["content"] = f"{existing}\n\n{instruction}"
+            msg["content"] = f"{instruction}\n\n{existing}"
         else:
             existing = getattr(msg, "content", "") or ""
-            msg.content = f"{existing}\n\n{instruction}"
+            msg.content = f"{instruction}\n\n{existing}"
     else:
         # Prepend new system message
         messages.insert(0, {"role": "system", "content": instruction})
 
     return messages
+
+
+# =============================================================================
+# Anthropic Messages API Endpoints
+# =============================================================================
+
+
+@app.post("/v1/messages")
+async def create_anthropic_message(
+    request: Request,
+):
+    """
+    Anthropic Messages API endpoint.
+
+    Translates Anthropic-format requests to OpenAI format, runs inference
+    through the existing engine, and converts the response back.
+
+    Supports both streaming and non-streaming modes.
+    """
+    engine = get_engine()
+
+    # Parse the raw body to handle Anthropic request format
+    body = await request.json()
+    anthropic_request = AnthropicRequest(**body)
+
+    # --- Detailed request logging ---
+    n_msgs = len(anthropic_request.messages)
+    total_chars = 0
+    last_user_preview = ""
+    for m in anthropic_request.messages:
+        content = m.content if isinstance(m.content, str) else str(m.content)
+        total_chars += len(content)
+        if m.role == "user":
+            last_user_preview = content[:300]
+    sys_chars = len(anthropic_request.system) if anthropic_request.system else 0
+    n_tools = len(anthropic_request.tools) if anthropic_request.tools else 0
+    logger.info(
+        f"[REQUEST] POST /v1/messages (anthropic) stream={anthropic_request.stream} "
+        f"model={anthropic_request.model!r} max_tokens={anthropic_request.max_tokens} "
+        f"msgs={n_msgs} total_chars={total_chars} system_chars={sys_chars} "
+        f"tools={n_tools}"
+    )
+    logger.info(f"[REQUEST] last user message preview: {last_user_preview!r}")
+
+    # Convert Anthropic request -> OpenAI request
+    openai_request = anthropic_to_openai(anthropic_request)
+
+    if anthropic_request.stream:
+        return StreamingResponse(
+            _disconnect_guard(
+                _stream_anthropic_messages(engine, openai_request, anthropic_request),
+                request,
+            ),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            },
+        )
+
+    # Non-streaming: run inference through existing engine
+    messages, images, videos = extract_multimodal_content(
+        openai_request.messages,
+        preserve_native_format=engine.preserve_native_tool_format,
+    )
+
+    chat_kwargs = {
+        "max_tokens": openai_request.max_tokens or _default_max_tokens,
+        "temperature": openai_request.temperature,
+        "top_p": openai_request.top_p,
+    }
+
+    if openai_request.tools:
+        chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
+
+    start_time = time.perf_counter()
+    timeout = _default_timeout
+
+    output = await _wait_with_disconnect(
+        engine.chat(messages=messages, **chat_kwargs),
+        request,
+        timeout=timeout,
+    )
+    if output is None:
+        return Response(status_code=499)  # Client closed request
+
+    elapsed = time.perf_counter() - start_time
+    tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
+    logger.info(
+        f"Anthropic messages: {output.completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
+    )
+
+    # Parse tool calls
+    cleaned_text, tool_calls = _parse_tool_calls_with_parser(
+        output.text, openai_request
+    )
+
+    # Clean output text
+    final_content = None
+    if cleaned_text:
+        final_content = clean_output_text(cleaned_text)
+
+    # Determine finish reason
+    finish_reason = "tool_calls" if tool_calls else output.finish_reason
+
+    # Build OpenAI response to convert
+    openai_response = ChatCompletionResponse(
+        model=openai_request.model,
+        choices=[
+            ChatCompletionChoice(
+                message=AssistantMessage(
+                    content=final_content,
+                    tool_calls=tool_calls,
+                ),
+                finish_reason=finish_reason,
+            )
+        ],
+        usage=Usage(
+            prompt_tokens=output.prompt_tokens,
+            completion_tokens=output.completion_tokens,
+            total_tokens=output.prompt_tokens + output.completion_tokens,
+        ),
+    )
+
+    # Convert to Anthropic response
+    anthropic_response = openai_to_anthropic(openai_response, anthropic_request.model)
+    return Response(
+        content=anthropic_response.model_dump_json(exclude_none=True),
+        media_type="application/json",
+    )
+
+
+@app.post("/v1/messages/count_tokens")
+async def count_anthropic_tokens(request: Request):
+    """
+    Count tokens for an Anthropic Messages API request.
+
+    Uses the model's tokenizer for accurate counting.
+    Claude Code calls this endpoint for token budgeting.
+    Note: Don't parse via AnthropicRequest — count_tokens requests
+    from Claude Code don't include max_tokens.
+    """
+    body = await request.json()
+
+    engine = get_engine()
+    tokenizer = engine.tokenizer
+
+    total_tokens = 0
+
+    # System message
+    system = body.get("system", "")
+    if isinstance(system, str) and system:
+        total_tokens += len(tokenizer.encode(system))
+    elif isinstance(system, list):
+        for block in system:
+            if isinstance(block, dict):
+                text = block.get("text", "")
+                if text:
+                    total_tokens += len(tokenizer.encode(text))
+
+    # Messages
+    for msg in body.get("messages", []):
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            if content:
+                total_tokens += len(tokenizer.encode(content))
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    text = block.get("text", "")
+                    if text:
+                        total_tokens += len(tokenizer.encode(text))
+                    # tool_use input
+                    if block.get("input"):
+                        total_tokens += len(
+                            tokenizer.encode(json.dumps(block["input"]))
+                        )
+                    # tool_result content
+                    sub_content = block.get("content", "")
+                    if isinstance(sub_content, str) and sub_content:
+                        total_tokens += len(tokenizer.encode(sub_content))
+                    elif isinstance(sub_content, list):
+                        for item in sub_content:
+                            if isinstance(item, dict):
+                                item_text = item.get("text", "")
+                                if item_text:
+                                    total_tokens += len(tokenizer.encode(item_text))
+
+    # Tools
+    for tool in body.get("tools", []):
+        name = tool.get("name", "")
+        if name:
+            total_tokens += len(tokenizer.encode(name))
+        desc = tool.get("description", "")
+        if desc:
+            total_tokens += len(tokenizer.encode(desc))
+        if tool.get("input_schema"):
+            total_tokens += len(tokenizer.encode(json.dumps(tool["input_schema"])))
+
+    return {"input_tokens": total_tokens}
+
+
+async def _stream_anthropic_messages(
+    engine: BaseEngine,
+    openai_request: ChatCompletionRequest,
+    anthropic_request: AnthropicRequest,
+) -> AsyncIterator[str]:
+    """
+    Stream Anthropic Messages API SSE events.
+
+    Converts OpenAI streaming chunks to Anthropic event format:
+    message_start -> content_block_start -> content_block_delta* ->
+    content_block_stop -> message_delta -> message_stop
+    """
+    msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+    start_time = time.perf_counter()
+
+    # Extract messages for engine
+    messages, images, videos = extract_multimodal_content(
+        openai_request.messages,
+        preserve_native_format=engine.preserve_native_tool_format,
+    )
+
+    chat_kwargs = {
+        "max_tokens": openai_request.max_tokens or _default_max_tokens,
+        "temperature": openai_request.temperature,
+        "top_p": openai_request.top_p,
+    }
+
+    if openai_request.tools:
+        chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
+
+    # Emit message_start
+    message_start = {
+        "type": "message_start",
+        "message": {
+            "id": msg_id,
+            "type": "message",
+            "role": "assistant",
+            "model": anthropic_request.model,
+            "content": [],
+            "stop_reason": None,
+            "stop_sequence": None,
+            "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+            },
+        },
+    }
+    yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
+
+    # Emit content_block_start for text
+    content_block_start = {
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {"type": "text", "text": ""},
+    }
+    yield f"event: content_block_start\ndata: {json.dumps(content_block_start)}\n\n"
+
+    # Stream content deltas
+    accumulated_text = ""
+    completion_tokens = 0
+
+    async for output in engine.stream_chat(messages=messages, **chat_kwargs):
+        delta_text = output.new_text
+
+        # Track token counts
+        if hasattr(output, "completion_tokens") and output.completion_tokens:
+            completion_tokens = output.completion_tokens
+
+        if delta_text:
+            # Filter special tokens
+            content = SPECIAL_TOKENS_PATTERN.sub("", delta_text)
+
+            if content:
+                accumulated_text += content
+                delta_event = {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": content},
+                }
+                yield f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
+
+    # Check for tool calls in accumulated text
+    _, tool_calls = _parse_tool_calls_with_parser(accumulated_text, openai_request)
+
+    # Emit content_block_stop for text block
+    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+
+    # If there are tool calls, emit tool_use blocks
+    if tool_calls:
+        for i, tc in enumerate(tool_calls):
+            tool_index = i + 1
+            try:
+                tool_input = json.loads(tc.function.arguments)
+            except (json.JSONDecodeError, AttributeError):
+                tool_input = {}
+
+            # content_block_start for tool_use
+            tool_block_start = {
+                "type": "content_block_start",
+                "index": tool_index,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": tc.id,
+                    "name": tc.function.name,
+                    "input": {},
+                },
+            }
+            yield f"event: content_block_start\ndata: {json.dumps(tool_block_start)}\n\n"
+
+            # Send input as a single delta
+            input_json = json.dumps(tool_input)
+            input_delta = {
+                "type": "content_block_delta",
+                "index": tool_index,
+                "delta": {"type": "input_json_delta", "partial_json": input_json},
+            }
+            yield f"event: content_block_delta\ndata: {json.dumps(input_delta)}\n\n"
+
+            # content_block_stop
+            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': tool_index})}\n\n"
+
+    # Determine stop reason
+    stop_reason = "tool_use" if tool_calls else "end_turn"
+
+    # Emit message_delta with stop_reason and usage
+    message_delta = {
+        "type": "message_delta",
+        "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+        "usage": {"output_tokens": completion_tokens},
+    }
+    yield f"event: message_delta\ndata: {json.dumps(message_delta)}\n\n"
+
+    # Log throughput
+    elapsed = time.perf_counter() - start_time
+    tokens_per_sec = completion_tokens / elapsed if elapsed > 0 else 0
+    logger.info(
+        f"Anthropic messages (stream): {completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
+    )
+
+    # Emit message_stop
+    yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
 
 
 # =============================================================================
@@ -989,8 +1687,12 @@ async def stream_completion(
     async for output in engine.stream_generate(
         prompt=prompt,
         max_tokens=request.max_tokens or _default_max_tokens,
-        temperature=request.temperature,
-        top_p=request.top_p,
+        temperature=(
+            request.temperature
+            if request.temperature is not None
+            else _default_temperature
+        ),
+        top_p=request.top_p if request.top_p is not None else _default_top_p,
         stop=request.stop,
     ):
         data = {
@@ -1020,7 +1722,10 @@ async def stream_chat_completion(
     **kwargs,
 ) -> AsyncIterator[str]:
     """Stream chat completion response."""
+    global _tool_parser_instance
+
     response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+    start_time = time.perf_counter()
 
     # Check if we should include usage in the final chunk
     include_usage = request.stream_options and request.stream_options.include_usage
@@ -1046,7 +1751,7 @@ async def stream_chat_completion(
     if _reasoning_parser:
         _reasoning_parser.reset_state()
 
-    # Track accumulated text for reasoning parser
+    # Track accumulated text for reasoning parser and tool call parsing
     accumulated_text = ""
 
     # Track token counts for usage reporting
@@ -1054,10 +1759,33 @@ async def stream_chat_completion(
     completion_tokens = 0
     last_output = None
 
+    # Tool call streaming state
+    global _tool_parser_instance
+    tool_parser = None
+    tool_accumulated_text = ""
+    tool_calls_detected = False
+    if _enable_auto_tool_choice and _tool_call_parser:
+        # Initialize parser if needed (same as _parse_tool_calls_with_parser)
+        if _tool_parser_instance is None:
+            try:
+                parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
+                tokenizer = None
+                if _engine is not None and hasattr(_engine, "_tokenizer"):
+                    tokenizer = _engine._tokenizer
+                _tool_parser_instance = parser_cls(tokenizer)
+                logger.info(f"Initialized tool call parser: {_tool_call_parser}")
+            except Exception as e:
+                logger.warning(f"Failed to init tool parser for streaming: {e}")
+        if _tool_parser_instance is not None:
+            tool_parser = _tool_parser_instance
+            tool_parser.reset()
+
     # Stream content
     async for output in engine.stream_chat(messages=messages, **kwargs):
         delta_text = output.new_text
         last_output = output
+        previous_text = accumulated_text
+        accumulated_text += delta_text
 
         # Track token counts from output (updated each chunk)
         if hasattr(output, "prompt_tokens") and output.prompt_tokens:
@@ -1067,8 +1795,6 @@ async def stream_chat_completion(
 
         # Use reasoning parser if enabled
         if _reasoning_parser and delta_text:
-            previous_text = accumulated_text
-            accumulated_text += delta_text
             delta_msg = _reasoning_parser.extract_reasoning_streaming(
                 previous_text, accumulated_text, delta_text
             )
@@ -1093,13 +1819,51 @@ async def stream_chat_completion(
             )
             yield f"data: {chunk.model_dump_json()}\n\n"
         else:
-            # Standard path without reasoning parsing
+            # Standard path without reasoning or tool call parsing
             content = delta_text
+
+            # Filter special tokens that may leak into streaming output
+            if content:
+                content = SPECIAL_TOKENS_PATTERN.sub("", content)
 
             # Add <think> prefix on first content chunk for thinking models
             if is_thinking_model and not think_prefix_sent and content:
                 content = "<think>" + content
                 think_prefix_sent = True
+
+            # Tool call streaming parsing
+            if tool_parser and delta_text:
+                tool_previous = tool_accumulated_text
+                tool_accumulated_text += delta_text
+                tool_result = tool_parser.extract_tool_calls_streaming(
+                    tool_previous, tool_accumulated_text, delta_text
+                )
+
+                if tool_result is None:
+                    # Inside tool markup - suppress output
+                    continue
+
+                if "tool_calls" in tool_result:
+                    # Emit structured tool calls
+                    tool_calls_detected = True
+                    chunk = ChatCompletionChunk(
+                        id=response_id,
+                        model=request.model,
+                        choices=[
+                            ChatCompletionChunkChoice(
+                                delta=ChatCompletionChunkDelta(
+                                    tool_calls=tool_result["tool_calls"]
+                                ),
+                                finish_reason="tool_calls" if output.finished else None,
+                            )
+                        ],
+                        usage=get_usage(output) if output.finished else None,
+                    )
+                    yield f"data: {chunk.model_dump_json()}\n\n"
+                    continue
+
+                # Normal content from tool parser
+                content = tool_result.get("content", "")
 
             chunk = ChatCompletionChunk(
                 id=response_id,
@@ -1109,12 +1873,62 @@ async def stream_chat_completion(
                         delta=ChatCompletionChunkDelta(
                             content=content if content else None
                         ),
-                        finish_reason=output.finish_reason if output.finished else None,
+                        finish_reason=(
+                            "tool_calls"
+                            if (output.finished and tool_calls_detected)
+                            else (output.finish_reason if output.finished else None)
+                        ),
                     )
                 ],
                 usage=get_usage(output) if output.finished else None,
             )
             yield f"data: {chunk.model_dump_json()}\n\n"
+
+    # Fallback: if tool parser accumulated text but never emitted tool_calls
+    # (e.g., </tool_call> never arrived - incomplete tool call)
+    has_tool_markup = (
+        "<tool_call>" in tool_accumulated_text
+        or "<function=" in tool_accumulated_text
+    )
+    if (
+        tool_parser
+        and tool_accumulated_text
+        and not tool_calls_detected
+        and has_tool_markup
+    ):
+        result = tool_parser.extract_tool_calls(tool_accumulated_text)
+        if result.tools_called:
+            tool_chunk = ChatCompletionChunk(
+                id=response_id,
+                model=request.model,
+                choices=[
+                    ChatCompletionChunkChoice(
+                        delta=ChatCompletionChunkDelta(
+                            tool_calls=[
+                                {
+                                    "index": i,
+                                    "id": tc["id"],
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc["name"],
+                                        "arguments": tc["arguments"],
+                                    },
+                                }
+                                for i, tc in enumerate(result.tool_calls)
+                            ]
+                        ),
+                        finish_reason="tool_calls",
+                    )
+                ],
+            )
+            yield f"data: {tool_chunk.model_dump_json()}\n\n"
+
+    # Log throughput
+    elapsed = time.perf_counter() - start_time
+    tokens_per_sec = completion_tokens / elapsed if elapsed > 0 else 0
+    logger.info(
+        f"Chat completion (stream): {completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
+    )
 
     # Send final chunk with usage if requested
     if include_usage:
@@ -1248,13 +2062,54 @@ Examples:
         choices=["qwen3", "deepseek_r1"],
         help="Enable reasoning content extraction with specified parser",
     )
+    parser.add_argument(
+        "--default-temperature",
+        type=float,
+        default=None,
+        help="Default temperature for generation when not specified in request",
+    )
+    parser.add_argument(
+        "--default-top-p",
+        type=float,
+        default=None,
+        help="Default top_p for generation when not specified in request",
+    )
+    parser.add_argument(
+        "--enable-auto-tool-choice",
+        action="store_true",
+        help="Enable automatic tool call parsing for models that support it",
+    )
+    parser.add_argument(
+        "--tool-call-parser",
+        type=str,
+        default=None,
+        choices=ToolParserManager.list_registered(),
+        help="Tool call parser to use (requires --enable-auto-tool-choice)",
+    )
+    parser.add_argument(
+        "--draft-model",
+        type=str,
+        default=None,
+        help="Draft model for speculative decoding (must use same tokenizer as main model)",
+    )
+    parser.add_argument(
+        "--num-draft-tokens",
+        type=int,
+        default=4,
+        help="Number of tokens to generate speculatively per step (default: 4)",
+    )
 
     args = parser.parse_args()
 
     # Set global configuration
     global _api_key, _default_timeout, _rate_limiter
+    global _default_temperature, _default_top_p
     _api_key = args.api_key
     _default_timeout = args.timeout
+    if args.default_temperature is not None:
+        _default_temperature = args.default_temperature
+    if args.default_top_p is not None:
+        _default_top_p = args.default_top_p
 
     # Configure rate limiter
     if args.rate_limit > 0:
@@ -1291,12 +2146,24 @@ Examples:
         _reasoning_parser = parser_cls()
         logger.info(f"Reasoning parser enabled: {args.reasoning_parser}")
 
+    # Configure tool call parsing
+    global _enable_auto_tool_choice, _tool_call_parser
+    if args.enable_auto_tool_choice:
+        _enable_auto_tool_choice = True
+        _tool_call_parser = args.tool_call_parser
+        if _tool_call_parser:
+            logger.info(f"Tool call parsing enabled with parser: {_tool_call_parser}")
+        else:
+            logger.info("Tool call parsing enabled with auto-detection")
+
     # Load model before starting server
     load_model(
         args.model,
         use_batching=args.continuous_batching,
         max_tokens=args.max_tokens,
         force_mllm=args.mllm,
+        draft_model=args.draft_model,
+        num_draft_tokens=args.num_draft_tokens,
     )
 
     # Start server

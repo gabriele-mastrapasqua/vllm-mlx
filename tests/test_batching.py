@@ -278,9 +278,8 @@ class TestSchedulerBasic:
 
         result = scheduler.abort_request("test-1")
 
+        # abort_request now enqueues abort for deferred processing (always returns True)
         assert result is True
-        assert scheduler.get_num_waiting() == 0
-        assert "test-1" in scheduler.finished_req_ids
 
     def test_abort_nonexistent_request(self, mock_model, mock_tokenizer):
         """Test aborting non-existent request."""
@@ -289,8 +288,9 @@ class TestSchedulerBasic:
             tokenizer=mock_tokenizer,
         )
 
+        # abort_request now enqueues abort for deferred processing (always returns True)
         result = scheduler.abort_request("nonexistent")
-        assert result is False
+        assert result is True
 
     def test_get_stats(self, mock_model, mock_tokenizer):
         """Test getting scheduler stats."""
