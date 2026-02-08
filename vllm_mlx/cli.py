@@ -29,6 +29,10 @@ def serve_command(args):
     from .scheduler import SchedulerConfig
     from .server import RateLimiter, app, load_model
 
+    # Configure log level (override module-level basicConfig)
+    log_level = getattr(args, "log_level", "info").upper()
+    logging.getLogger().setLevel(getattr(logging, log_level))
+
     logger = logging.getLogger(__name__)
 
     # Validate tool calling arguments
@@ -147,7 +151,7 @@ def serve_command(args):
 
     # Start server
     print(f"Starting server at http://{args.host}:{args.port}")
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
 
 
 def bench_command(args):
@@ -569,6 +573,13 @@ Examples:
         type=int,
         default=4,
         help="Number of tokens to generate speculatively per step (default: 4)",
+    )
+    serve_parser.add_argument(
+        "--log-level",
+        type=str,
+        default="info",
+        choices=["debug", "info", "warning", "error"],
+        help="Logging level (default: info)",
     )
 
     # Bench command
