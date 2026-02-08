@@ -15,6 +15,26 @@ Usage:
 import argparse
 import sys
 
+FALLBACK_MAX_TOKENS = 32768
+
+
+def _detect_max_tokens(model_name: str) -> int:
+    """Read max_position_embeddings from the model's config.json."""
+    try:
+        import json
+        from pathlib import Path
+
+        from huggingface_hub import hf_hub_download
+
+        config_path = hf_hub_download(model_name, "config.json")
+        config = json.loads(Path(config_path).read_text())
+        max_pos = config.get("max_position_embeddings")
+        if max_pos and isinstance(max_pos, int):
+            return max_pos
+    except Exception:
+        pass
+    return FALLBACK_MAX_TOKENS
+
 
 def serve_command(args):
     """Start the OpenAI-compatible server."""
@@ -81,6 +101,11 @@ def serve_command(args):
     else:
         print("  Tool calling: Use --enable-auto-tool-choice to enable")
     print("=" * 60)
+
+    # Auto-detect max_tokens from model config if not specified
+    if args.max_tokens is None:
+        args.max_tokens = _detect_max_tokens(args.model)
+        logger.info(f"Auto-detected max_tokens={args.max_tokens} from model config")
 
     print(f"Loading model: {args.model}")
     print(f"Default max tokens: {args.max_tokens}")
@@ -457,8 +482,8 @@ Examples:
     serve_parser.add_argument(
         "--max-tokens",
         type=int,
-        default=32768,
-        help="Default max tokens for generation (default: 32768)",
+        default=None,
+        help="Default max tokens for generation (default: auto-detect from model config)",
     )
     serve_parser.add_argument(
         "--continuous-batching",

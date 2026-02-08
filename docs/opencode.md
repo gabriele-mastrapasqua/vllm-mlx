@@ -32,7 +32,7 @@ uv run vllm-mlx serve mlx-community/Qwen2.5-3B-Instruct-4bit \
   --host 0.0.0.0 --port 8000 --api-key sk-dummy-prova \
   --continuous-batching \
   --tool-call-parser qwen --enable-auto-tool-choice \
-  --max-tokens 32000 --max-num-seqs 8 \
+  --max-num-seqs 8 \
   --prefill-batch-size 64 --completion-batch-size 128 \
   --cache-memory-percent 0.60 --stream-interval 1 \
   --rate-limit 3600 --timeout 900

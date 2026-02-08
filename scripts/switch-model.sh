@@ -19,8 +19,7 @@ API_KEY="sk-dummy-prova"
 PORT=8000
 HOST="0.0.0.0"
 
-# Server defaults
-MAX_TOKENS=32000
+# Server defaults (max_tokens auto-detected from model config)
 MAX_NUM_SEQS=8
 PREFILL_BATCH_SIZE=64
 COMPLETION_BATCH_SIZE=128
@@ -175,7 +174,6 @@ CMD=(
   --port "$PORT"
   --api-key "$API_KEY"
   --continuous-batching
-  --max-tokens "$MAX_TOKENS"
   --max-num-seqs "$MAX_NUM_SEQS"
   --prefill-batch-size "$PREFILL_BATCH_SIZE"
   --completion-batch-size "$COMPLETION_BATCH_SIZE"
