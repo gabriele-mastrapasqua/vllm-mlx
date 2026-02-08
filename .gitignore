@@ -95,3 +95,7 @@ temp/
 
 # MLX cache
 .mlx_cache/
+
+# devenv
+.devenv/
+.devenv.flake.nix
