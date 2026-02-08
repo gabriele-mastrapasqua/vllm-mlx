@@ -112,6 +112,14 @@ vllm-mlx-serve = "vllm_mlx.server_v2:main"
 vllm-mlx-chat = "vllm_mlx.gradio_app:main"
 vllm-mlx-bench = "vllm_mlx.benchmark:main"
 
+[tool.uv]
+# Override mlx-audio's transformers==5.0.0rc3 pin which conflicts with
+# the main transformers>=5.0.0 requirement during universal resolution.
+override-dependencies = [
+    "transformers>=5.0.0",
+    "mlx-lm>=0.30.6",
+]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["vllm_mlx*"]
