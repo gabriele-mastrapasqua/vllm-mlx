@@ -362,6 +362,7 @@ class SimpleEngine(BaseEngine):
 
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
+        tool_call_parser = kwargs.pop("tool_call_parser", None)
 
         # Build prompt using tokenizer
         if self._is_mllm:
@@ -415,11 +416,31 @@ class SimpleEngine(BaseEngine):
 
             try:
                 prompt = tokenizer.apply_chat_template(messages, **template_kwargs)
-            except TypeError:
-                # Some templates don't support all kwargs
+            except TypeError as e:
                 for key in ["tools", "enable_thinking"]:
                     if key in template_kwargs:
                         del template_kwargs[key]
+                if template_tools and tool_call_parser == "qwen":
+                    logger.warning(
+                        "Chat template does not support 'tools' param (TypeError: %s). "
+                        "Falling back to system prompt injection for %d tool(s).",
+                        e,
+                        len(template_tools),
+                    )
+                    from ..api.tool_calling import (
+                        build_tool_system_prompt,
+                        inject_tool_prompt,
+                    )
+
+                    tool_prompt = build_tool_system_prompt(template_tools)
+                    messages = inject_tool_prompt(messages, tool_prompt)
+                else:
+                    logger.warning(
+                        "Chat template does not support 'tools' param (TypeError: %s). "
+                        "Tools dropped (parser=%s).",
+                        e,
+                        tool_call_parser,
+                    )
                 prompt = tokenizer.apply_chat_template(messages, **template_kwargs)
         else:
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)

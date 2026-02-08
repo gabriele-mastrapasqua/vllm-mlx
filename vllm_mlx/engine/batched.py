@@ -325,6 +325,7 @@ class BatchedEngine(BaseEngine):
         messages: list[dict[str, Any]],
         tools: list[dict] | None = None,
         num_images: int = 0,
+        tool_call_parser: str | None = None,
     ) -> str:
         """Apply chat template to messages."""
         tokenizer = self.tokenizer
@@ -380,11 +381,36 @@ class BatchedEngine(BaseEngine):
                 template_kwargs["tools"] = tools
 
             try:
-                return tokenizer.apply_chat_template(messages, **template_kwargs)
-            except TypeError:
+                prompt = tokenizer.apply_chat_template(messages, **template_kwargs)
+                if tools:
+                    logger.debug("Prompt with tools (first 2000 chars): %.2000s", prompt)
+                return prompt
+            except TypeError as e:
                 for key in ["tools", "enable_thinking"]:
                     if key in template_kwargs:
                         del template_kwargs[key]
+                if tools and tool_call_parser == "qwen":
+                    logger.warning(
+                        "Chat template does not support 'tools' param (TypeError: %s). "
+                        "Falling back to system prompt injection for %d tool(s).",
+                        e,
+                        len(tools),
+                    )
+                    from vllm_mlx.api.tool_calling import (
+                        build_tool_system_prompt,
+                        inject_tool_prompt,
+                    )
+
+                    tool_prompt = build_tool_system_prompt(tools)
+                    messages = inject_tool_prompt(messages, tool_prompt)
+                else:
+                    logger.warning(
+                        "Chat template does not support 'tools' param (TypeError: %s). "
+                        "Tools dropped for %d tool(s) (parser=%s).",
+                        e,
+                        len(tools) if tools else 0,
+                        tool_call_parser,
+                    )
                 return tokenizer.apply_chat_template(messages, **template_kwargs)
         else:
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
@@ -585,12 +611,14 @@ class BatchedEngine(BaseEngine):
 
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
+        tool_call_parser = kwargs.pop("tool_call_parser", None)
 
         # Apply chat template
         prompt = self._apply_chat_template(
             messages,
             template_tools,
             num_images=len(all_images),
+            tool_call_parser=tool_call_parser,
         )
 
         return await self.generate(
@@ -696,12 +724,14 @@ class BatchedEngine(BaseEngine):
 
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
+        tool_call_parser = kwargs.pop("tool_call_parser", None)
 
         # Apply chat template
         prompt = self._apply_chat_template(
             messages,
             template_tools,
             num_images=len(all_images),
+            tool_call_parser=tool_call_parser,
         )
 
         # Compute prefix boundary for cache

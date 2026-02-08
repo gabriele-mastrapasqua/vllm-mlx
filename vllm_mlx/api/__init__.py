@@ -61,6 +61,8 @@ from .utils import (
 from .tool_calling import (
     parse_tool_calls,
     convert_tools_for_template,
+    build_tool_system_prompt,
+    inject_tool_prompt,
     # Structured output
     parse_json_output,
     validate_json_schema,
@@ -111,6 +113,8 @@ __all__ = [
     # Tool calling
     "parse_tool_calls",
     "convert_tools_for_template",
+    "build_tool_system_prompt",
+    "inject_tool_prompt",
     # Structured output
     "parse_json_output",
     "validate_json_schema",

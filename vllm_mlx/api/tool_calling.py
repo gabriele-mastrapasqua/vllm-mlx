@@ -392,6 +392,51 @@ def convert_tools_for_template(tools: Optional[List]) -> Optional[List[dict]]:
     return converted if converted else None
 
 
+def inject_tool_prompt(messages: list[dict], tool_prompt: str) -> list[dict]:
+    """Inject tool definitions into the system message (or create one).
+
+    Returns a deep copy of *messages* with *tool_prompt* appended to the
+    existing system message, or a new system message prepended.
+    """
+    import copy
+
+    messages = copy.deepcopy(messages)
+    for msg in messages:
+        if msg.get("role") == "system":
+            existing = msg.get("content", "")
+            msg["content"] = f"{existing}\n\n{tool_prompt}" if existing else tool_prompt
+            return messages
+    messages.insert(0, {"role": "system", "content": tool_prompt})
+    return messages
+
+
+def build_tool_system_prompt(tools: list[dict]) -> str:
+    """Fallback: format tools as text in the system prompt, in Qwen format.
+
+    Used when the tokenizer's chat template does not natively support the
+    ``tools`` parameter.  The output mirrors the format that the Qwen2.5
+    chat template would produce, so the model can still recognise tool
+    definitions and emit ``<tool_call>`` blocks.
+    """
+    lines = [
+        "# Tools\n",
+        "You may call one or more functions to assist with the user query.\n",
+        "You are provided with function signatures within <tools></tools> XML tags:\n",
+        "<tools>",
+    ]
+    for tool in tools:
+        func = tool.get("function", tool)
+        lines.append(json.dumps(func, ensure_ascii=False))
+    lines.append("</tools>\n")
+    lines.append(
+        "For each function call, return a JSON object within <tool_call></tool_call> tags:\n"
+        "<tool_call>\n"
+        '{"name": "<function_name>", "arguments": <args_json_object>}\n'
+        "</tool_call>"
+    )
+    return "\n".join(lines)
+
+
 def format_tool_call_for_message(tool_call: ToolCall) -> dict:
     """
     Format a ToolCall object for inclusion in a message.

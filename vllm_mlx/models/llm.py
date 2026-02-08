@@ -13,6 +13,7 @@ from typing import Iterator
 logger = logging.getLogger(__name__)
 
 
+
 @dataclass
 class GenerationOutput:
     """Output from text generation."""
@@ -319,6 +320,9 @@ class MLXLanguageModel:
         if not self._loaded:
             self.load()
 
+        # Extract tool_call_parser before it reaches generate()
+        tool_call_parser = kwargs.pop("tool_call_parser", None)
+
         # Apply chat template
         if hasattr(self.tokenizer, "apply_chat_template"):
             # Build kwargs for apply_chat_template
@@ -336,9 +340,30 @@ class MLXLanguageModel:
                     messages,
                     **template_kwargs,
                 )
-            except TypeError:
-                # Tokenizer doesn't support tools parameter
+            except TypeError as e:
                 del template_kwargs["tools"]
+                if tools and tool_call_parser == "qwen":
+                    logger.warning(
+                        "Chat template does not support 'tools' param (TypeError: %s). "
+                        "Falling back to system prompt injection for %d tool(s).",
+                        e,
+                        len(tools),
+                    )
+                    from vllm_mlx.api.tool_calling import (
+                        build_tool_system_prompt,
+                        inject_tool_prompt,
+                    )
+
+                    tool_prompt = build_tool_system_prompt(tools)
+                    messages = inject_tool_prompt(messages, tool_prompt)
+                else:
+                    logger.warning(
+                        "Chat template does not support 'tools' param (TypeError: %s). "
+                        "Tools dropped for %d tool(s) (parser=%s).",
+                        e,
+                        len(tools) if tools else 0,
+                        tool_call_parser,
+                    )
                 prompt = self.tokenizer.apply_chat_template(
                     messages,
                     **template_kwargs,
@@ -347,6 +372,9 @@ class MLXLanguageModel:
             # Fallback: simple concatenation
             prompt = "\n".join(f"{msg['role']}: {msg['content']}" for msg in messages)
             prompt += "\nassistant:"
+
+        if tools:
+            logger.debug("Prompt with tools (first 1500 chars): %.1500s", prompt)
 
         return self.generate(
             prompt=prompt,

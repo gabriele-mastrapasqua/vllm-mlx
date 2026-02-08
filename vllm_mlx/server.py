@@ -1187,6 +1187,8 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     # Add tools if provided
     if request.tools:
         chat_kwargs["tools"] = convert_tools_for_template(request.tools)
+        if _tool_call_parser:
+            chat_kwargs["tool_call_parser"] = _tool_call_parser
 
     if request.stream:
         return StreamingResponse(
@@ -1402,6 +1404,8 @@ async def create_anthropic_message(
 
     if openai_request.tools:
         chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
+        if _tool_call_parser:
+            chat_kwargs["tool_call_parser"] = _tool_call_parser
 
     start_time = time.perf_counter()
     timeout = _default_timeout
@@ -1559,6 +1563,8 @@ async def _stream_anthropic_messages(
 
     if openai_request.tools:
         chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
+        if _tool_call_parser:
+            chat_kwargs["tool_call_parser"] = _tool_call_parser
 
     # Emit message_start
     message_start = {
