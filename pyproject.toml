@@ -28,12 +28,13 @@ classifiers = [
 ]
 
 dependencies = [
-    "mlx>=0.29.0",
-    "mlx-lm>=0.30.2",  # GLM-4 models require 0.30.2+
+    "mlx>=0.30.4",
+    "mlx-lm>=0.30.6",  # GLM-4 MoE models require 0.30.6+ for glm4_moe_lite support
     "mlx-vlm>=0.1.0",  # VLM support
-    "transformers>=4.40.0,<=5.0.0rc1",  # Pinned to avoid rc3 video processing bug
+    "transformers>=5.0.0",  # Required by mlx-lm>=0.30.6 for MoE model support
     "tokenizers>=0.19.0",
     "huggingface-hub>=0.23.0",
+    "filelock>=3.20.0",  # Required by huggingface-hub for proper locking
     "numpy>=1.24.0",
     "pillow>=10.0.0",
     "tqdm>=4.66.0",
@@ -82,7 +83,7 @@ guided = [
 ]
 # Audio dependencies for TTS/STT (mlx-audio)
 audio = [
-    "mlx-audio>=0.2.9",
+    "mlx-audio>=0.3.1",
     "sounddevice>=0.4.0",
     "soundfile>=0.12.0",
     "scipy>=1.10.0",
@@ -114,6 +115,14 @@ vllm-mlx = "vllm_mlx.cli:main"
 vllm-mlx-serve = "vllm_mlx.server_v2:main"
 vllm-mlx-chat = "vllm_mlx.gradio_app:main"
 vllm-mlx-bench = "vllm_mlx.benchmark:main"
+
+[tool.uv]
+# Override mlx-audio's transformers==5.0.0rc3 pin which conflicts with
+# the main transformers>=5.0.0 requirement during universal resolution.
+override-dependencies = [
+    "transformers>=5.0.0",
+    "mlx-lm>=0.30.6",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]

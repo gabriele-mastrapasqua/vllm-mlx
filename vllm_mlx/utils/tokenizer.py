@@ -5,6 +5,9 @@ Tokenizer utilities with fallback support for non-standard tokenizers.
 Some models (e.g., Nemotron) use non-standard tokenizer configurations
 that transformers doesn't recognize. This module provides fallback loading
 directly from tokenizer.json.
+
+Now includes support for MoE (Mixture of Experts) models that have extra
+parameters not recognized by standard loaders (e.g., embed_q.biases/scales).
 """
 
 import json
@@ -28,7 +31,7 @@ def _needs_tokenizer_fallback(model_name: str) -> bool:
     return any(pattern.lower() in model_lower for pattern in FALLBACK_MODELS)
 
 
-def load_model_with_fallback(model_name: str, tokenizer_config: dict = None):
+def load_model_with_fallback(model_name: str, tokenizer_config: dict | None = None):
     """
     Load model and tokenizer with fallback for non-standard tokenizers.
 
@@ -43,7 +46,7 @@ def load_model_with_fallback(model_name: str, tokenizer_config: dict = None):
 
     tokenizer_config = tokenizer_config or {}
 
-    # Check if model needs fallback (e.g., Nemotron)
+    # Check if model needs tokenizer fallback (e.g., Nemotron)
     if _needs_tokenizer_fallback(model_name):
         logger.info(
             f"Model {model_name} requires tokenizer fallback, loading directly..."

@@ -103,3 +103,4 @@ temp/
 devenv.lock
 devenv.nix
 devenv.yaml
+.aider*
