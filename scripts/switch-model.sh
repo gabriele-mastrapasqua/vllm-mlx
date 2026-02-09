@@ -43,6 +43,9 @@ MODELS["mlx-community/Qwen3-8B-4bit"]="qwen"
 MODELS["mlx-community/Llama-3.2-3B-Instruct-4bit"]="llama"
 MODELS["mlx-community/Llama-3.3-70B-Instruct-4bit"]="llama"
 MODELS["mlx-community/Mistral-7B-Instruct-v0.3-4bit"]="mistral"
+MODELS["mlx-community/Mistral-Small-3.1-24B-Instruct-2025-04-01-4bit"]="mistral"
+MODELS["mlx-community/Devstral-Small-2505-4bit"]="mistral"
+MODELS["mlx-community/Ministral-8B-Instruct-2410-4bit"]="mistral"
 MODELS["mlx-community/NousResearch-Hermes-3-Llama-3.1-8B-4bit"]="hermes"
 
 # ── Select model ────────────────────────────────────────
@@ -161,10 +164,25 @@ cat > "$OPENCODE_CONFIG" << EOF
 EOF
 echo "Wrote $OPENCODE_CONFIG"
 
-# ── Clear OpenCode cache ────────────────────────────────
+# ── Clear OpenCode cache + stale sessions ───────────────
+# Cache: provider packages (forces re-download)
 if [ -d "$OPENCODE_CACHE" ]; then
   rm -rf "$OPENCODE_CACHE"
-  echo "Cleared $OPENCODE_CACHE"
+  echo "Cleared cache: $OPENCODE_CACHE"
+fi
+
+# State: sessions DB and data (keeps only auth.json we just wrote)
+# Old sessions from a different model cause errors when resumed
+OPENCODE_DATA="$HOME/.local/share/opencode"
+if [ -d "$OPENCODE_DATA" ]; then
+  find "$OPENCODE_DATA" -mindepth 1 ! -name 'auth.json' -exec rm -rf {} + 2>/dev/null || true
+  echo "Cleared sessions/state in $OPENCODE_DATA (kept auth.json)"
+fi
+
+# Kill any lingering OpenCode processes
+if pkill -f 'opencode' 2>/dev/null; then
+  echo "Killed lingering OpenCode processes"
+  sleep 1
 fi
 
 # ── Build and run server command ────────────────────────
