@@ -15,7 +15,6 @@
 set -euo pipefail
 
 # ── Config ──────────────────────────────────────────────
-API_KEY="sk-dummy-prova"
 PORT=8000
 HOST="0.0.0.0"
 
@@ -112,7 +111,7 @@ echo ""
 # ── Write OpenCode auth ─────────────────────────────────
 mkdir -p "$(dirname "$OPENCODE_AUTH")"
 cat > "$OPENCODE_AUTH" << EOF
-{"vllm-local": {"type": "api", "key": "$API_KEY"}}
+{"vllm-local": {"type": "api", "key": ""}}
 EOF
 echo "Wrote $OPENCODE_AUTH"
 
@@ -133,8 +132,7 @@ cat > "$OPENCODE_CONFIG" << EOF
       "npm": "@ai-sdk/openai-compatible",
       "name": "$DISPLAY_NAME Local",
       "options": {
-        "baseURL": "http://localhost:$PORT/v1",
-        "apiKey": "$API_KEY"
+        "baseURL": "http://localhost:$PORT/v1"
       },
       "models": {
         "default": {
@@ -190,7 +188,6 @@ CMD=(
   uv run vllm-mlx serve "$MODEL"
   --host "$HOST"
   --port "$PORT"
-  --api-key "$API_KEY"
   --continuous-batching
   --max-num-seqs "$MAX_NUM_SEQS"
   --prefill-batch-size "$PREFILL_BATCH_SIZE"
