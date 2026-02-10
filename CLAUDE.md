@@ -2,17 +2,13 @@
 
 ## Git workflow
 
-**Always work on a feature branch.** Never commit directly to `main`.
-
-Before starting any task (feature, fix, refactor, experiment):
+**Prefer working on a feature branch** for non-trivial changes.
 
 ```bash
 git checkout -b feat/<short-description>   # or fix/, refactor/, etc.
 ```
 
-Commit early and often on the branch. Only merge to `main` via PR after testing.
-
-This prevents half-done or experimental changes from polluting `main` and makes it easy to discard work that doesn't pan out.
+Commit early and often. Direct merge to `main` and push is allowed — no PR required.
 
 ## Testing
 
